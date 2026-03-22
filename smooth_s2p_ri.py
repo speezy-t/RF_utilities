@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-smooth_s2p_ri.py  –  Smooth noisy S2P (Touchstone) files in Real/Imaginary format.
+smooth_s2p_ri.py  –  Smooth noisy S2P files in Real/Imaginary format.
 
-Unlike magnitude/phase files, RI data needs no phase-unwrapping – real and imaginary
-parts are continuous signals that can be filtered directly.  The smoothed Re and Im
-components are written back out in RI format; the computed magnitude is shown in the
-optional report but is NOT written to the file (the RI values are the source of truth).
+Workflow:
+  1. Read the RI-format .s2p file.
+  2. Convert every S-parameter to dB magnitude + phase (degrees).
+  3. Smooth magnitude directly; smooth phase with unwrap → filter → re-wrap
+     (identical method to smooth_s2p_v2.py).
+  4. Write the result as a DB-format .s2p file.
+
+The output is always DB format regardless of the input format, which is more
+convenient for most VNA post-processing tools.
 
 Usage:
     python smooth_s2p_ri.py input.s2p [output.s2p]
@@ -15,8 +20,8 @@ Usage:
                             [--freq-range 27.5 31.0]
                             [--report]
 
-The script will error if the file's option line declares a format other than RI.
-Use smooth_s2p_v2.py for MA or DB format files.
+The script errors if the file is not RI format (use smooth_s2p_v2.py for
+MA or DB input files).
 
 Dependencies:
     pip install numpy scipy matplotlib
@@ -42,8 +47,7 @@ def parse_s2p(filepath: str):
     comments : list[str]
     options  : dict  (freq_unit, param, fmt, z0, raw_line)
     data     : np.ndarray shape (N, 9)
-        Columns: freq, Re(S11), Im(S11), Re(S21), Im(S21),
-                       Re(S12), Im(S12), Re(S22), Im(S22)
+        Columns: freq, col1, col2, ... col8  (meaning depends on fmt)
     """
     comments = []
     options = {"freq_unit": "GHz", "param": "S", "fmt": "RI", "z0": 50.0, "raw_line": None}
@@ -89,7 +93,28 @@ def parse_s2p(filepath: str):
 
 
 # ---------------------------------------------------------------------------
-# Smoothing
+# Format conversion
+# ---------------------------------------------------------------------------
+
+def ri_to_db(data: np.ndarray) -> np.ndarray:
+    """Convert an RI-format data array to DB/angle format.
+
+    Input  columns: freq, Re(S11), Im(S11), Re(S21), Im(S21), ...
+    Output columns: freq, dB(S11), ang(S11), dB(S21), ang(S21), ...
+    """
+    out = data.copy()
+    for rc, ic in [(1, 2), (3, 4), (5, 6), (7, 8)]:
+        re = data[:, rc]
+        im = data[:, ic]
+        mag_lin = np.sqrt(re ** 2 + im ** 2)
+        mag_lin = np.where(mag_lin == 0.0, 1e-30, mag_lin)
+        out[:, rc] = 20.0 * np.log10(mag_lin)          # dB magnitude
+        out[:, ic] = np.rad2deg(np.arctan2(im, re))    # phase in degrees
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Smoothing  (identical logic to smooth_s2p_v2.py)
 # ---------------------------------------------------------------------------
 
 def _auto_window(n: int, window: int, poly: int):
@@ -103,7 +128,7 @@ def _auto_window(n: int, window: int, poly: int):
     return window, poly
 
 
-def smooth_data(
+def smooth_db_data(
     data: np.ndarray,
     window: int = 21,
     poly: int = 3,
@@ -113,42 +138,41 @@ def smooth_data(
     freq_unit: str = "GHz",
 ) -> np.ndarray:
     """
-    Smooth RI-format S-parameter data.
+    Smooth DB/angle S-parameter data with phase unwrapping.
 
-    Real and imaginary parts are both continuous, so they are filtered directly
-    with no unwrapping step required.
+    Odd-indexed columns (1, 3, 5, 7) are dB magnitudes – filtered directly.
+    Even-indexed columns (2, 4, 6, 8) are phase angles – unwrapped to a
+    continuous signal, filtered, then re-wrapped to [-180, 180].
 
     Parameters
     ----------
-    data       : (N, 9) array – freq + [Re, Im] × 4 S-params
-    window     : Savitzky-Golay window length (odd, must be > poly)
+    data       : (N, 9) array in DB/angle format
+    window     : Savitzky-Golay window length (odd, > poly)
     poly       : Savitzky-Golay polynomial order
     method     : 'savgol' or 'gaussian'
-    sigma_mhz  : Gaussian kernel width in MHz. Converted to points internally
-                 using the file's actual step size, so the same value gives
-                 consistent physical smoothing regardless of sweep density.
-    freq_range : (f_start_GHz, f_stop_GHz) or None for full sweep
-    freq_unit  : frequency unit string from the option line ('MHz', 'GHz', etc.)
+    sigma_mhz  : Gaussian kernel width in MHz; converted to points from the
+                 file's actual step size so behaviour is independent of
+                 sweep density.
+    freq_range : (f_start_GHz, f_stop_GHz) or None for the full sweep
+    freq_unit  : frequency unit from the option line ('MHz', 'GHz', etc.)
     """
     n = data.shape[0]
     smoothed = data.copy()
 
-    # Derive step size in MHz directly from the frequency column
-    freq_native = data[:, 0]
-    step_native = np.median(np.diff(freq_native))   # median is robust to irregular spacing
+    # Step size → sigma in points
+    step_native = np.median(np.diff(data[:, 0]))
     freq_to_mhz = {"hz": 1e-6, "khz": 1e-3, "mhz": 1.0, "ghz": 1e3}.get(
         freq_unit.lower(), 1.0
     )
-    step_mhz = step_native * freq_to_mhz
+    step_mhz  = step_native * freq_to_mhz
     sigma_pts = sigma_mhz / step_mhz
     print(f"  [info] Step size: {step_mhz:.4f} MHz  →  sigma = {sigma_mhz:.1f} MHz = {sigma_pts:.2f} points")
 
-    # Determine which indices to smooth (optional band restriction)
+    # Index range to smooth (optional band restriction)
     if freq_range is not None:
-        mhz_per_native = freq_to_mhz
-        f_lo = freq_range[0] * 1e3 / mhz_per_native   # GHz → native unit
-        f_hi = freq_range[1] * 1e3 / mhz_per_native
-        mask = (freq_native >= f_lo) & (freq_native <= f_hi)
+        f_lo = freq_range[0] * 1e3 / freq_to_mhz   # GHz → native unit
+        f_hi = freq_range[1] * 1e3 / freq_to_mhz
+        mask = (data[:, 0] >= f_lo) & (data[:, 0] <= f_hi)
         idxs = np.where(mask)[0]
         if len(idxs) < 4:
             print(f"  [warn] Only {len(idxs)} points in freq_range – smoothing full sweep instead.")
@@ -160,14 +184,27 @@ def smooth_data(
     if w != window:
         print(f"  [info] Window reduced to {w} (poly {p}) to fit {len(idxs)} points.")
 
-    # Smooth every data column identically – Re and Im are both plain signals
     for col in range(1, 9):
-        y_full = smoothed[:, col].copy()
-        y = y_full[idxs]
-        if method == "savgol":
-            y_full[idxs] = savgol_filter(y, window_length=w, polyorder=p)
+        y_full   = smoothed[:, col].copy()
+        y        = y_full[idxs]
+        is_phase = (col % 2 == 0)   # even cols = phase angle
+
+        if is_phase:
+            # Unwrap → smooth → re-wrap to [-180, 180]
+            y_unwrapped = np.unwrap(np.deg2rad(y))
+            if method == "savgol":
+                y_smooth = savgol_filter(y_unwrapped, window_length=w, polyorder=p)
+            else:
+                y_smooth = gaussian_filter1d(y_unwrapped, sigma=sigma_pts)
+            y_smooth_deg = np.rad2deg(y_smooth)
+            y_full[idxs] = (y_smooth_deg + 180.0) % 360.0 - 180.0
         else:
-            y_full[idxs] = gaussian_filter1d(y, sigma=sigma_pts)
+            # dB magnitude – filter directly
+            if method == "savgol":
+                y_full[idxs] = savgol_filter(y, window_length=w, polyorder=p)
+            else:
+                y_full[idxs] = gaussian_filter1d(y, sigma=sigma_pts)
+
         smoothed[:, col] = y_full
 
     return smoothed
@@ -177,23 +214,20 @@ def smooth_data(
 # Writer
 # ---------------------------------------------------------------------------
 
-def write_s2p(filepath: str, comments: list, options: dict,
-              data: np.ndarray, source_file: str) -> None:
-    """Write smoothed data back as a Touchstone S2P file, preserving the RI format."""
+def write_s2p_db(filepath: str, comments: list, options: dict,
+                 data: np.ndarray, source_file: str) -> None:
+    """Write a DB/angle Touchstone S2P file."""
     with open(filepath, "w") as fh:
         for c in comments:
             fh.write(c + "\n")
         fh.write(f"! Smoothed by smooth_s2p_ri.py  –  source: {source_file}\n")
-        if options.get("raw_line"):
-            fh.write(options["raw_line"] + "\n")
-        else:
-            fh.write(
-                f"# {options['freq_unit']} {options['param']} RI R {options['z0']:.0f}\n"
-            )
+        fh.write(
+            f"# {options['freq_unit']} {options['param']} DB R {options['z0']:.0f}\n"
+        )
         for row in data:
             freq = row[0]
             freq_str = f"{freq:.6e}" if freq >= 1e9 else f"{freq:.6f}"
-            pairs = " ".join(f"{row[i]:>16.8e} {row[i+1]:>16.8e}" for i in range(1, 9, 2))
+            pairs = " ".join(f"{row[i]:>14.6e} {row[i+1]:>14.6e}" for i in range(1, 9, 2))
             fh.write(f"{freq_str}  {pairs}\n")
 
 
@@ -201,14 +235,9 @@ def write_s2p(filepath: str, comments: list, options: dict,
 # Report
 # ---------------------------------------------------------------------------
 
-def generate_report(orig: np.ndarray, smoothed: np.ndarray,
+def generate_report(db_orig: np.ndarray, db_smoothed: np.ndarray,
                     options: dict, output_png: str, freq_range=None) -> None:
-    """
-    Save a 3-row × 4-col PNG:
-      Row 0 – Real part (Re)
-      Row 1 – Imaginary part (Im)
-      Row 2 – Magnitude in dB computed from smoothed Re/Im, overlaid on original magnitude
-    """
+    """Two-row × 4-col PNG: dB magnitude (row 0) and phase (row 1) per S-param."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -220,26 +249,27 @@ def generate_report(orig: np.ndarray, smoothed: np.ndarray,
 
     fu = options.get("freq_unit", "GHz").lower()
     to_ghz = {"hz": 1e-9, "khz": 1e-6, "mhz": 1e-3, "ghz": 1.0}.get(fu, 1.0)
-    freq_ghz = orig[:, 0] * to_ghz
+    freq_ghz = db_orig[:, 0] * to_ghz
 
     if freq_range:
         mask = (freq_ghz >= freq_range[0]) & (freq_ghz <= freq_range[1])
     else:
         mask = np.ones(len(freq_ghz), dtype=bool)
 
-    f = freq_ghz[mask]
-    params = ["S11", "S21", "S12", "S22"]
-    # Column pairs: (re_col, im_col)
+    f         = freq_ghz[mask]
+    params    = ["S11", "S21", "S12", "S22"]
     col_pairs = [(1, 2), (3, 4), (5, 6), (7, 8)]
 
-    fig = plt.figure(figsize=(16, 12), facecolor="#0e1117")
-    fig.suptitle("S2P RI Smoothing Report  –  smooth_s2p_ri.py",
-                 color="white", fontsize=13, y=0.995)
-    gs = GridSpec(3, 4, figure=fig, hspace=0.50, wspace=0.33)
+    fig = plt.figure(figsize=(16, 9), facecolor="#0e1117")
+    fig.suptitle(
+        "S2P RI → DB Smoothing Report  –  smooth_s2p_ri.py",
+        color="white", fontsize=13, y=0.995
+    )
+    gs = GridSpec(2, 4, figure=fig, hspace=0.45, wspace=0.33)
 
     def style(ax, title, ylabel):
         ax.set_facecolor("#1a1d27")
-        ax.set_title(title, color="white", fontsize=8.5, pad=5)
+        ax.set_title(title, color="white", fontsize=9, pad=5)
         ax.set_xlabel("Freq (GHz)", color="#aaaacc", fontsize=7)
         ax.set_ylabel(ylabel, color="#aaaacc", fontsize=7)
         ax.tick_params(colors="#888899", labelsize=6)
@@ -247,35 +277,18 @@ def generate_report(orig: np.ndarray, smoothed: np.ndarray,
         ax.grid(True, color="#2a2d3a", lw=0.5)
         ax.set_xlim(f[0], f[-1])
 
-    for col_idx, (param, (rc, ic)) in enumerate(zip(params, col_pairs)):
-        # Row 0 – Real
-        ax_re = fig.add_subplot(gs[0, col_idx])
-        style(ax_re, f"{param}  Re", "Real")
-        ax_re.plot(f, orig[mask, rc],     color="#ff6666", lw=0.5, alpha=0.7, label="Original")
-        ax_re.plot(f, smoothed[mask, rc], color="#66aaff", lw=1.4,            label="Smoothed")
-        if col_idx == 0:
-            ax_re.legend(fontsize=6, facecolor="#1a1d27", labelcolor="white", framealpha=0.8)
-
-        # Row 1 – Imaginary
-        ax_im = fig.add_subplot(gs[1, col_idx])
-        style(ax_im, f"{param}  Im", "Imaginary")
-        ax_im.plot(f, orig[mask, ic],     color="#ff6666", lw=0.5, alpha=0.7)
-        ax_im.plot(f, smoothed[mask, ic], color="#66aaff", lw=1.4)
-
-        # Row 2 – Magnitude in dB (derived from Re/Im)
-        ax_mag = fig.add_subplot(gs[2, col_idx])
+    for col_idx, (param, (mc, pc)) in enumerate(zip(params, col_pairs)):
+        ax_mag = fig.add_subplot(gs[0, col_idx])
         style(ax_mag, f"{param}  Magnitude (dB)", "dB")
+        ax_mag.plot(f, db_orig[mask, mc],     color="#ff6666", lw=0.5, alpha=0.7, label="RI-converted")
+        ax_mag.plot(f, db_smoothed[mask, mc], color="#66aaff", lw=1.4,            label="Smoothed")
+        if col_idx == 0:
+            ax_mag.legend(fontsize=6, facecolor="#1a1d27", labelcolor="white", framealpha=0.8)
 
-        # Guard against log(0)
-        eps = 1e-30
-        mag_orig = 20.0 * np.log10(
-            np.sqrt(orig[mask, rc] ** 2 + orig[mask, ic] ** 2) + eps
-        )
-        mag_smth = 20.0 * np.log10(
-            np.sqrt(smoothed[mask, rc] ** 2 + smoothed[mask, ic] ** 2) + eps
-        )
-        ax_mag.plot(f, mag_orig, color="#ff6666", lw=0.5, alpha=0.7)
-        ax_mag.plot(f, mag_smth, color="#66aaff", lw=1.4)
+        ax_phs = fig.add_subplot(gs[1, col_idx])
+        style(ax_phs, f"{param}  Phase (°)", "degrees")
+        ax_phs.plot(f, db_orig[mask, pc],     color="#ff6666", lw=0.5, alpha=0.7)
+        ax_phs.plot(f, db_smoothed[mask, pc], color="#66aaff", lw=1.4)
 
     plt.savefig(output_png, dpi=150, bbox_inches="tight", facecolor="#0e1117")
     plt.close()
@@ -289,9 +302,9 @@ def generate_report(orig: np.ndarray, smoothed: np.ndarray,
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Smooth a noisy S2P file in Real/Imaginary (RI) format. "
-            "Re and Im parts are filtered directly – no phase unwrapping needed. "
-            "For MA or DB format files use smooth_s2p_v2.py instead."
+            "Read an RI-format S2P file, convert to dB/angle internally, "
+            "smooth using phase-unwrap-aware filtering (same method as smooth_s2p_v2.py), "
+            "and write a DB-format output file."
         )
     )
     parser.add_argument("input",  help="Input .s2p file (must be RI format)")
@@ -300,26 +313,25 @@ def main():
 
     parser.add_argument("--window", type=int, default=21,
                         help="Savitzky-Golay window length, must be odd (default 21). "
-                             "Larger values = more smoothing.")
+                             "Larger = more smoothing.")
     parser.add_argument("--poly",   type=int, default=3,
                         help="Savitzky-Golay polynomial order (default 3). "
-                             "Lower values = smoother curve.")
+                             "Lower = smoother.")
     parser.add_argument("--method", choices=["savgol", "gaussian"], default="savgol",
-                        help="Filter type: 'savgol' (default) works well for dense measured data; "
-                             "'gaussian' is better for sparse simulation sweeps (e.g. 50 MHz steps).")
+                        help="Filter: 'savgol' (default) for dense measured data; "
+                             "'gaussian' for sparse simulation sweeps (e.g. 50 MHz steps).")
     parser.add_argument("--sigma",  type=float, default=100.0,
                         help="Gaussian kernel width in MHz (default 100 MHz). "
-                             "Automatically converted to points from the file's actual step size, "
-                             "so the same value gives consistent smoothing regardless of sweep density. "
+                             "Auto-converted to points from the file's step size. "
                              "Only used with --method gaussian.")
     parser.add_argument("--freq-range", nargs=2, type=float,
                         metavar=("START_GHz", "STOP_GHz"),
-                        help="Restrict smoothing to this band (GHz). Points outside the band are "
-                             "written through unchanged.")
+                        help="Restrict smoothing to this band (GHz). "
+                             "Points outside are written through unchanged.")
     parser.add_argument("--report", action="store_true",
-                        help="Save a before/after PNG showing Re, Im, and computed magnitude.")
+                        help="Save a before/after PNG (dB mag + phase for each S-param).")
     parser.add_argument("--force",  action="store_true",
-                        help="Skip the RI format check and process the file anyway.")
+                        help="Skip the RI format check and process anyway.")
 
     args = parser.parse_args()
 
@@ -328,33 +340,34 @@ def main():
         Path(input_path).with_stem(Path(input_path).stem + "_smoothed")
     )
 
-    # Ensure window is odd
     window = args.window
     if window % 2 == 0:
         window += 1
         print(f"  [info] Window must be odd – adjusted to {window}.")
 
     print(f"Reading  : {input_path}")
-    comments, options, data = parse_s2p(input_path)
-    print(f"  Points : {data.shape[0]}")
+    comments, options, ri_data = parse_s2p(input_path)
+    print(f"  Points : {ri_data.shape[0]}")
     print(f"  Format : {options['fmt']}  ({options['freq_unit']})")
 
-    # Guard: refuse non-RI files unless --force is set
     if options["fmt"].upper() != "RI" and not args.force:
         print(
-            f"\n  [error] This file uses '{options['fmt']}' format, not RI.\n"
-            "          Use smooth_s2p_v2.py for MA or DB files.\n"
-            "          Pass --force to override this check and smooth anyway\n"
-            "          (results will be incorrect for phase columns in non-RI files)."
+            f"\n  [error] This file is '{options['fmt']}' format, not RI.\n"
+            "          Use smooth_s2p_v2.py for MA or DB input files.\n"
+            "          Pass --force to skip this check."
         )
         raise SystemExit(1)
+
+    # Convert RI → DB/angle before smoothing
+    print("Converting: RI → dB/angle")
+    db_data = ri_to_db(ri_data)
 
     print(f"Method   : {args.method}  |  window={window}, poly={args.poly}, sigma={args.sigma} MHz")
     if args.freq_range:
         print(f"Freq band: {args.freq_range[0]} – {args.freq_range[1]} GHz")
 
-    smoothed = smooth_data(
-        data,
+    db_smoothed = smooth_db_data(
+        db_data,
         window=window,
         poly=args.poly,
         method=args.method,
@@ -363,29 +376,26 @@ def main():
         freq_unit=options["freq_unit"],
     )
 
-    print(f"Writing  : {output_path}")
-    write_s2p(output_path, comments, options, smoothed, Path(input_path).name)
+    print(f"Writing  : {output_path}  (DB format)")
+    write_s2p_db(output_path, comments, options, db_smoothed, Path(input_path).name)
 
-    # Summary statistics
-    print("\nMax absolute change per column:")
-    labels = ["S11 Re", "S11 Im", "S21 Re", "S21 Im",
-              "S12 Re", "S12 Im", "S22 Re", "S22 Im"]
+    # Summary
+    print("\nMax change per S-parameter (phase = circular distance):")
+    labels = ["S11 Mag", "S11 Phase", "S21 Mag", "S21 Phase",
+              "S12 Mag", "S12 Phase", "S22 Mag", "S22 Phase"]
     for i, label in enumerate(labels, start=1):
-        delta = np.max(np.abs(smoothed[:, i] - data[:, i]))
-        print(f"  {label}: {delta:.6f}")
-
-    # Also report magnitude change (computed from Re/Im)
-    print("\nMax magnitude change (dB, computed from Re/Im):")
-    eps = 1e-30
-    param_names = ["S11", "S21", "S12", "S22"]
-    for k, (rc, ic) in enumerate([(1,2),(3,4),(5,6),(7,8)]):
-        mag_o = 20.0 * np.log10(np.sqrt(data[:,rc]**2     + data[:,ic]**2)     + eps)
-        mag_s = 20.0 * np.log10(np.sqrt(smoothed[:,rc]**2 + smoothed[:,ic]**2) + eps)
-        print(f"  {param_names[k]}: {np.max(np.abs(mag_s - mag_o)):.4f} dB")
+        diff     = db_smoothed[:, i] - db_data[:, i]
+        is_phase = (i % 2 == 0)
+        if is_phase:
+            delta = np.max(np.abs(((diff + 180.0) % 360.0) - 180.0))
+        else:
+            delta = np.max(np.abs(diff))
+        print(f"  {label}: {delta:.4f}")
 
     if args.report:
         report_path = str(Path(output_path).with_suffix(".png"))
-        generate_report(data, smoothed, options, report_path, freq_range=args.freq_range)
+        generate_report(db_data, db_smoothed, options, report_path,
+                        freq_range=args.freq_range)
 
     print("\nDone.")
 
